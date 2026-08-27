@@ -1,13 +1,18 @@
 const axios = require("axios");
 const fs = require("fs-extra");
 const path = require("path");
-const { box, bold, line } = require("../../func/style.js");
 
-const BASE = "https://downloader-hub.onrender.com";
+const BASE = "https://christus-downloader.vercel.app";
 const AUTO_URL = `${BASE}/api/auto`;
 const SUPPORTED_URL = `${BASE}/api/supported`;
 
-// Liste de secours si /api/supported est injoignable (ex: cold start Render)
+const FB_BASE = "https://your-download-hub.vercel.app";
+const FB_AUTO_URL = `${FB_BASE}/api/auto`;
+
+const HEADER = "📥 𝗖𝗵𝗿𝗶𝘀𝘁𝘂𝘀 𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱𝗲𝗿\n━━━━━━━━━\n\n";
+
+const FB_DOMAINS = ["facebook.com", "fb.watch"];
+
 let supportedDomains = [
   "facebook.com", "fb.watch",
   "youtube.com", "youtu.be",
@@ -29,42 +34,55 @@ const refreshSupportedDomains = async () => {
     const res = await axios.get(SUPPORTED_URL, { timeout: 15000 });
     const list = Array.isArray(res.data) ? res.data : res.data?.domains;
     if (Array.isArray(list) && list.length) supportedDomains = list;
-  } catch {
-    // on garde la liste de secours en cas d'échec
-  }
+  } catch {}
 };
 
 refreshSupportedDomains();
-setInterval(refreshSupportedDomains, 30 * 60 * 1000); // rafraîchi toutes les 30 min
+setInterval(refreshSupportedDomains, 30 * 60 * 1000);
+
+const extractMedia = (data) => {
+  const fromMedias = data.medias?.find(m => m.type === "video")?.url
+    || data.medias?.find(m => m.type === "audio")?.url;
+
+  const mediaURL = fromMedias || data.high_quality || data.low_quality || data.audio || data.data?.mp4 || data.data?.mp3;
+  const isAudio = !fromMedias && !data.high_quality && !data.low_quality && !!data.audio;
+
+  return { mediaURL, isAudio };
+};
 
 module.exports = {
   config: {
-    name: "alldl",
-    aliases: ["autodl", "dl"],
-    version: "3.0",
+    name: "autodl",
+    aliases: ["alldl", "dl"],
+    version: "3.1",
     author: "Christus",
     countDown: 5,
     role: 0,
+    description: {
+      en: "Universal video/media downloader supporting 17+ platforms"
+    },
     category: "utility",
-    description: { en: "Téléchargeur vidéo/média tout-en-un" },
+    nixPrefix: true,
     guide: {
-      en: "Envoie simplement un lien média supporté (https://) pour le télécharger automatiquement."
+      en: "Send any supported media link (https://) to download it automatically.\n" +
+          "Supported: YouTube, Facebook, TikTok, Instagram, Likee, CapCut,\n" +
+          "Spotify, Terabox, Twitter, Google Drive, SoundCloud, NDown, Pinterest"
     }
   },
 
-  onStart: async function ({ reply }) {
-    return reply(box({
-      title: "Christus Downloader",
-      emoji: "📥",
-      body: "Envoie un lien vidéo/média (https://) depuis n'importe quel site supporté (YouTube, Facebook, TikTok, Instagram, Likee, CapCut, Spotify, Terabox, Twitter, Google Drive, SoundCloud, NDown, Pinterest, etc.) pour le télécharger automatiquement."
-    }));
+  onStart: async function ({ sock, chatId, event, reply }) {
+    return sock.sendMessage(chatId, {
+      text: `${HEADER}Envoie un lien vidéo/média (https://) depuis n'importe quel site supporté (YouTube, Facebook, TikTok, Instagram, Likee, CapCut, Spotify, Terabox, Twitter, Google Drive, SoundCloud, NDown, Pinterest, etc.) pour le télécharger automatiquement.`
+    }, { quoted: event });
   },
 
   onChat: async function ({ sock, chatId, event, reply }) {
     const content = (event.message?.conversation || event.message?.extendedTextMessage?.text || "").trim();
     if (content.toLowerCase().startsWith("auto")) return;
     if (!content.startsWith("https://")) return;
-    if (!supportedDomains.some(domain => content.includes(domain))) return;
+
+    const isFacebook = FB_DOMAINS.some(domain => content.includes(domain));
+    if (!isFacebook && !supportedDomains.some(domain => content.includes(domain))) return;
 
     await sock.sendMessage(chatId, { react: { text: "⌛️", key: event.key } });
 
@@ -72,7 +90,8 @@ module.exports = {
     let filePath;
 
     try {
-      const res = await axios.get(AUTO_URL, {
+      const targetUrl = isFacebook ? FB_AUTO_URL : AUTO_URL;
+      const res = await axios.get(targetUrl, {
         params: { url: content },
         timeout: 30000
       });
@@ -81,17 +100,19 @@ module.exports = {
 
       const { title, platform } = res.data;
 
-      // On ne se fie pas au champ "type" de l'API (peu fiable, ex: Snapchat
-      // renvoie parfois "audio" alors qu'un format vidéo existe). On privilégie
-      // systématiquement la vidéo si un format vidéo est disponible, et on ne
-      // bascule sur l'audio que s'il n'y a aucun format vidéo (Spotify, SoundCloud...).
-      const mediaURL = res.data.high_quality || res.data.low_quality || res.data.audio;
-      const isAudio = !res.data.high_quality && !res.data.low_quality && !!res.data.audio;
+      const { mediaURL, isAudio } = extractMedia(res.data);
 
       if (!mediaURL) throw new Error("Média introuvable");
 
       const extension = isAudio ? "mp3" : "mp4";
-      const buffer = (await axios.get(mediaURL, { responseType: "arraybuffer", timeout: 60000 })).data;
+      const buffer = (await axios.get(mediaURL, {
+        responseType: "arraybuffer",
+        timeout: 60000,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          "Referer": targetUrl
+        }
+      })).data;
 
       await fs.ensureDir(cacheDir);
       filePath = path.join(cacheDir, `auto_media_${Date.now()}.${extension}`);
@@ -99,27 +120,33 @@ module.exports = {
 
       await sock.sendMessage(chatId, { react: { text: "✅️", key: event.key } });
 
-      const infoMsg = box({
-        title: "Christus Downloader",
-        emoji: "📥",
-        body: `${bold("Titre")}      : ${title || "Titre inconnu"}\n`
-          + `${bold("Plateforme")} : ${platform || "Inconnue"}\n`
-          + `${bold("Statut")}     : Succès`
-      });
+      const infoMsg =
+        `${HEADER}` +
+        `Titre      : ${title || "Titre inconnu"}\n` +
+        `Plateforme : ${platform || (isFacebook ? "Facebook" : "Inconnue")}\n` +
+        `Statut     : Succès`;
 
-      const mediaBuffer = fs.readFileSync(filePath);
       if (isAudio) {
-        await sock.sendMessage(chatId, { text: infoMsg }, { quoted: event });
-        await sock.sendMessage(chatId, { audio: mediaBuffer, mimetype: "audio/mpeg" }, { quoted: event });
+        await sock.sendMessage(chatId, {
+          text: infoMsg
+        }, { quoted: event });
+        await sock.sendMessage(chatId, {
+          audio: fs.readFileSync(filePath),
+          mimetype: "audio/mpeg"
+        }, { quoted: event });
       } else {
-        await sock.sendMessage(chatId, { video: mediaBuffer, caption: infoMsg }, { quoted: event });
+        await sock.sendMessage(chatId, {
+          video: fs.readFileSync(filePath),
+          caption: infoMsg
+        }, { quoted: event });
       }
 
       fs.unlinkSync(filePath);
+
     } catch (err) {
       console.error("❌ Christus Downloader error:", err.response?.data || err.message);
       await sock.sendMessage(chatId, { react: { text: "❌️", key: event.key } });
-      reply(box({ title: "Christus Downloader", emoji: "📥", body: "❌ Une erreur est survenue lors du téléchargement." }));
+      reply(`${HEADER}❌ Une erreur est survenue lors du téléchargement.\n📄 Raison: ${err.response?.data?.error || err.message || "Erreur inconnue"}`);
       if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
     }
   }
