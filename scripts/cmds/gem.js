@@ -1,6 +1,8 @@
 const axios = require("axios");
 const fs = require("fs-extra");
 const path = require("path");
+const { downloadContentFromMessage } = require("@whiskeysockets/baileys");
+const { uploadImage } = global.utils;
 
 const BASE = "https://image-gen-fix.vercel.app";
 const GENERATE_URL = `${BASE}/generate`;
@@ -19,28 +21,11 @@ const extractErrorMessage = (err) => {
   return err.message || "Erreur inconnue";
 };
 
-async function getBufferFromURL(url) {
-  try {
-    const response = await axios.get(url, {
-      responseType: 'arraybuffer',
-      timeout: 30000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-        'Accept': 'image/avif,image/webp,image/*,*/*;q=0.8'
-      }
-    });
-    return Buffer.from(response.data);
-  } catch (error) {
-    console.error('Erreur de téléchargement image:', error.message);
-    return null;
-  }
-}
-
 module.exports = {
   config: {
     name: "gem",
     aliases: ["gen", "imagine", "generate"],
-    version: "1.1",
+    version: "1.2",
     author: "Christus",
     role: 0,
     countDown: 10,
@@ -60,6 +45,10 @@ module.exports = {
   },
 
   onStart: async function ({ sock, chatId, args, event, senderId, reply, prefix, commandName }) {
+    if (!fs.existsSync(path.join(__dirname, "cache"))) {
+      fs.mkdirSync(path.join(__dirname, "cache"), { recursive: true });
+    }
+
     let cleanArgs = [...args];
 
     let ratio = "1:1";
@@ -69,36 +58,75 @@ module.exports = {
       cleanArgs.splice(ratioIndex, 1);
     }
 
-    let imageSource = null;
+    let prompt = cleanArgs.join(" ").trim();
     let isEdit = false;
+    let imageBuffer = null;
 
-    if (event.message?.messageReply?.message?.imageMessage) {
-      const quotedMsg = event.message.messageReply;
-      if (quotedMsg.message?.imageMessage) {
-        imageSource = quotedMsg.message.imageMessage.url;
-        isEdit = true;
-      } else if (quotedMsg.message?.videoMessage) {
-        imageSource = quotedMsg.message.videoMessage.url;
-        isEdit = true;
+    // Vérifier si l'utilisateur a répondu à une image
+    const contextInfo = event.message?.extendedTextMessage?.contextInfo;
+    const quoted = contextInfo?.quotedMessage;
+    
+    // Détection des différents types de messages répondus
+    const imageMsg = quoted?.imageMessage
+      || quoted?.documentWithCaptionMessage?.message?.imageMessage
+      || quoted?.viewOnceMessageV2?.message?.imageMessage
+      || null;
+
+    if (imageMsg) {
+      try {
+        const stream = await downloadContentFromMessage(imageMsg, "image");
+        const chunks = [];
+        for await (const chunk of stream) chunks.push(chunk);
+        const buffer = Buffer.concat(chunks);
+        if (buffer && buffer.length > 100) {
+          imageBuffer = buffer;
+          isEdit = true;
+        }
+      } catch (err) {
+        console.error("Erreur téléchargement image répondue:", err.message);
       }
     }
 
+    // Vérifier si un lien d'image est présent dans les arguments
     if (!isEdit) {
-      const urlIndex = cleanArgs.findIndex((a) => /^https?:\/\/\S+$/i.test(a));
+      const urlIndex = cleanArgs.findIndex((a) => /^https?:\/\/\S+\.(jpg|jpeg|png|gif|webp)/i.test(a));
       if (urlIndex !== -1) {
-        imageSource = cleanArgs[urlIndex];
-        cleanArgs.splice(urlIndex, 1);
-        isEdit = true;
+        try {
+          const response = await axios.get(cleanArgs[urlIndex], {
+            responseType: "arraybuffer",
+            timeout: 30000
+          });
+          imageBuffer = Buffer.from(response.data);
+          isEdit = true;
+          cleanArgs.splice(urlIndex, 1);
+          prompt = cleanArgs.join(" ").trim();
+        } catch (err) {
+          console.error("Erreur téléchargement image URL:", err.message);
+          imageBuffer = null;
+          isEdit = false;
+        }
       }
     }
 
-    const prompt = cleanArgs.join(" ").trim();
+    // Si c'est une édition mais qu'il n'y a pas de prompt, définir un prompt par défaut
+    if (isEdit && !prompt) {
+      prompt = "améliorer cette image";
+    }
 
-    if (!prompt) {
+    // Si ce n'est pas une édition et qu'il n'y a pas de prompt
+    if (!isEdit && !prompt) {
       return reply(
-        `${HEADER}❓ Décris ce que tu veux ${isEdit ? "modifier sur l'image" : "générer"}.\n\n` +
+        `${HEADER}❓ Décris ce que tu veux générer.\n\n` +
         `💡 ${prefix}gem un dragon de cristal 16:9\n` +
         `💡 ${prefix}gem ajoute un chapeau (en réponse à une photo)`
+      );
+    }
+
+    // Si c'est une édition mais qu'il n'y a pas d'image
+    if (isEdit && !imageBuffer) {
+      return reply(
+        `${HEADER}❌ Impossible de récupérer l'image.\n\n` +
+        `💡 Répondez à une image ou fournissez une URL d'image valide.`
       );
     }
 
@@ -107,22 +135,37 @@ module.exports = {
         text: `${HEADER}⏳ ${isEdit ? "Modification" : "Génération"} en cours...\n📝 Prompt: ${prompt.substring(0, 50)}${prompt.length > 50 ? '...' : ''}\n📐 Ratio: ${ratio}`
       }, { quoted: event });
 
-      let imageBuffer;
+      let resultBuffer;
 
       if (isEdit) {
+        // Uploader l'image pour l'édition
+        const uploadedUrl = await uploadImage(imageBuffer);
+        
         const response = await axios.post(
           EDIT_URL,
-          { prompt, image: imageSource, ratio },
-          { responseType: "arraybuffer", timeout: 90000 }
+          { prompt, image: uploadedUrl, ratio },
+          { 
+            responseType: "arraybuffer", 
+            timeout: 90000,
+            headers: {
+              'Content-Type': 'application/json'
+            }
+          }
         );
-        imageBuffer = Buffer.from(response.data);
+        resultBuffer = Buffer.from(response.data);
       } else {
         const response = await axios.post(
           GENERATE_URL,
           { prompt, ratio, format: "jpg", nw: true },
-          { responseType: "arraybuffer", timeout: 90000 }
+          { 
+            responseType: "arraybuffer", 
+            timeout: 90000,
+            headers: {
+              'Content-Type': 'application/json'
+            }
+          }
         );
-        imageBuffer = Buffer.from(response.data);
+        resultBuffer = Buffer.from(response.data);
       }
 
       await sock.sendMessage(chatId, { delete: waitMsg.key }).catch(() => {});
@@ -134,14 +177,23 @@ module.exports = {
         `🔄 Utilisez ${prefix}gem <description> pour en générer d'autres.`;
 
       await sock.sendMessage(chatId, {
-        image: imageBuffer,
+        image: resultBuffer,
         caption: caption
       }, { quoted: event });
 
     } catch (err) {
       console.error("❌ Christus Gem error:", err.response?.data || err.message);
       const errorMsg = extractErrorMessage(err);
-      return reply(`${HEADER}❌ Échec de la ${isEdit ? "modification" : "génération"}.\n📄 Raison: ${errorMsg}`);
+      
+      let helpMsg = "";
+      if (isEdit) {
+        helpMsg = `\n\n💡 Astuces pour l'édition:\n` +
+                  `• Répondez à une image avec votre instruction\n` +
+                  `• Exemple: ajoute un chapeau à cette personne\n` +
+                  `• Exemple: rends cette image en style anime`;
+      }
+      
+      return reply(`${HEADER}❌ Échec de la ${isEdit ? "modification" : "génération"}.\n📄 Raison: ${errorMsg}${helpMsg}`);
     }
   }
 };
