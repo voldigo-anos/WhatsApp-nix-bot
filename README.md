@@ -490,4 +490,5 @@ Then: WhatsApp → Settings → Linked Devices → Link a Device → Enter code
 
 [Facebook](https://fb.com/100001611578438) · [Telegram](https://t.me/@aryannix) · [WhatsApp](https://wa.me/+8801903910486) · [Instagram](https://ig.com/aryan_rayhan_07)
 
-```RAILPACK_INSTALL_CMD=bun install
+```
+RAILPACK_INSTALL_CMD=bun install
