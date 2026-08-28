@@ -1,29 +1,14 @@
 const axios = require("axios");
 const fs = require("fs-extra");
 const path = require("path");
-
-async function getBufferFromURL(url) {
-  try {
-    const response = await axios.get(url, {
-      responseType: 'arraybuffer',
-      timeout: 60000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-        'Accept': 'image/avif,image/webp,image/*,*/*;q=0.8'
-      }
-    });
-    return Buffer.from(response.data);
-  } catch (error) {
-    console.error('Erreur de téléchargement image:', error.message);
-    return null;
-  }
-}
+const { downloadContentFromMessage } = require("@whiskeysockets/baileys");
+const { uploadImage } = global.utils;
 
 module.exports = {
   config: {
     name: "seedream4",
     aliases: ["sd4", "seedream"],
-    version: "1.2",
+    version: "1.3",
     author: "Christus",
     countDown: 5,
     role: 0,
@@ -42,21 +27,6 @@ module.exports = {
   },
 
   onStart: async function ({ sock, chatId, args, event, senderId, reply, prefix, commandName }) {
-    const quotedMsg = event.message?.messageReply;
-    let imageRepondue = null;
-
-    if (quotedMsg?.message?.imageMessage) {
-      imageRepondue = {
-        type: "photo",
-        url: quotedMsg.message.imageMessage.url
-      };
-    } else if (quotedMsg?.message?.videoMessage) {
-      imageRepondue = {
-        type: "video",
-        url: quotedMsg.message.videoMessage.url
-      };
-    }
-
     let prompt = args.join(" ").trim();
 
     let ratioAspect = "Auto";
@@ -67,15 +37,71 @@ module.exports = {
     }
 
     const ratiosValides = ["1:1","9:16","16:9","3:4","4:3","3:2","2:3","4:5","5:4","21:9","Auto"];
-    if (!imageRepondue && !ratiosValides.includes(ratioAspect)) {
-      return reply(
-        "❌ Ratio invalide.\n\n📐 Ratios disponibles :\n" +
-        "• 1:1  • 9:16  • 16:9  • 3:4  • 4:3\n" +
-        "• 3:2  • 2:3  • 4:5  • 5:4  • 21:9"
-      );
+    let imageBuffer = null;
+    let isEdit = false;
+
+    // Récupérer l'image en réponse
+    const quotedMessage = event.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    const imageMsg = quotedMessage?.imageMessage 
+      || quotedMessage?.viewOnceMessage?.message?.imageMessage
+      || quotedMessage?.documentWithCaptionMessage?.message?.imageMessage
+      || null;
+
+    if (imageMsg) {
+      try {
+        const stream = await downloadContentFromMessage(
+          imageMsg.imageMessage || imageMsg,
+          'image'
+        );
+        const chunks = [];
+        for await (const chunk of stream) {
+          chunks.push(chunk);
+        }
+        imageBuffer = Buffer.concat(chunks);
+        if (imageBuffer && imageBuffer.length > 100) {
+          isEdit = true;
+        } else {
+          imageBuffer = null;
+        }
+      } catch (err) {
+        console.error("Erreur téléchargement image répondue:", err.message);
+        imageBuffer = null;
+      }
     }
 
-    if (!prompt && !imageRepondue) {
+    // Si pas d'image en réponse, vérifier une URL dans les arguments
+    if (!isEdit) {
+      const urlIndex = args.findIndex((a) => /^https?:\/\/\S+\.(jpg|jpeg|png|gif|webp|bmp)/i.test(a));
+      if (urlIndex !== -1) {
+        try {
+          const url = args[urlIndex];
+          const resp = await axios.get(url, {
+            responseType: "arraybuffer",
+            timeout: 30000,
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+          });
+          imageBuffer = Buffer.from(resp.data);
+          if (imageBuffer && imageBuffer.length > 100) {
+            isEdit = true;
+            // retirer l'URL des arguments pour garder seulement le prompt
+            args.splice(urlIndex, 1);
+            prompt = args.join(" ").trim();
+          } else {
+            imageBuffer = null;
+          }
+        } catch (err) {
+          console.error("Erreur téléchargement image URL:", err.message);
+        }
+      }
+    }
+
+    // Si c'est une édition et qu'on a un prompt vide, définir un défaut
+    if (isEdit && !prompt) {
+      prompt = "améliorer cette image";
+    }
+
+    // Vérifications finales
+    if (!isEdit && !prompt) {
       return reply(
         `❌ Fournissez un prompt.\n\n📝 Exemples :\n` +
         `${prefix}seedream4 une ville cyberpunk\n` +
@@ -84,39 +110,66 @@ module.exports = {
       );
     }
 
+    if (isEdit && !imageBuffer) {
+      return reply(
+        `❌ Impossible de récupérer l'image.\n\n` +
+        `💡 Répondez à une image valide ou fournissez une URL d'image.`
+      );
+    }
+
+    if (!isEdit && !ratiosValides.includes(ratioAspect)) {
+      return reply(
+        "❌ Ratio invalide.\n\n📐 Ratios disponibles :\n" +
+        "• 1:1  • 9:16  • 16:9  • 3:4  • 4:3\n" +
+        "• 3:2  • 2:3  • 4:5  • 5:4  • 21:9"
+      );
+    }
+
     try {
       const waitMsg = await sock.sendMessage(chatId, {
-        text: imageRepondue 
+        text: isEdit 
           ? `🖼️ Modification de votre image en cours...\n📝 Prompt: ${prompt || "Éditer cette image"}`
           : `🎨 Génération de votre image en cours...\n📝 Prompt: ${prompt}\n📐 Ratio: ${ratioAspect}`
       }, { quoted: event });
 
-      const params = new URLSearchParams();
-      if (imageRepondue) {
-        params.append("prompt", prompt || "Éditer cette image");
-        params.append("imgurl", imageRepondue.url);
+      let resultBuffer;
+
+      if (isEdit) {
+        // Uploader l'image pour l'édition
+        const uploadedUrl = await uploadImage(imageBuffer);
+        
+        const params = new URLSearchParams();
+        params.append("prompt", prompt);
+        params.append("imgurl", uploadedUrl);
+        // L'API d'édition ignore le ratio, on ne l'envoie pas
+
+        const urlComplete = `https://sakura-apis.onrender.com/api/seedream4?${params.toString()}`;
+        const response = await axios.get(urlComplete, {
+          responseType: "arraybuffer",
+          timeout: 180000,
+        });
+        resultBuffer = Buffer.from(response.data);
       } else {
+        const params = new URLSearchParams();
         params.append("prompt", prompt);
         params.append("aspect_ratio", ratioAspect);
-      }
 
-      const urlComplete = `https://sakura-apis.onrender.com/api/seedream4?${params.toString()}`;
-      
-      const response = await axios.get(urlComplete, {
-        responseType: "arraybuffer",
-        timeout: 180000,
-      });
+        const urlComplete = `https://sakura-apis.onrender.com/api/seedream4?${params.toString()}`;
+        const response = await axios.get(urlComplete, {
+          responseType: "arraybuffer",
+          timeout: 180000,
+        });
+        resultBuffer = Buffer.from(response.data);
+      }
 
       await sock.sendMessage(chatId, { delete: waitMsg.key }).catch(() => {});
 
-      const imageBuffer = Buffer.from(response.data);
-
-      const corps = imageRepondue
+      const corps = isEdit
         ? `✅ Image modifiée avec succès !\n\n📝 Prompt : ${prompt}\n🔄 Utilisez ${prefix}seedream4 <prompt> pour en générer d'autres.`
         : `✅ Image générée avec succès !\n\n📝 Prompt : ${prompt}\n📐 Ratio : ${ratioAspect}\n🔄 Utilisez ${prefix}seedream4 <prompt> pour en générer d'autres.`;
 
       await sock.sendMessage(chatId, {
-        image: imageBuffer,
+        image: resultBuffer,
         caption: corps
       }, { quoted: event });
 
